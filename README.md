@@ -1,3 +1,3 @@
 # NightFrost-Bot
 
-|hi|
+hi
