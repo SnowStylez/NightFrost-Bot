@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import io
+import json
 import logging
 import os
 import random
@@ -21,15 +22,17 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from collections import defaultdict
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import aiosqlite
     import discord
     from discord import app_commands
-    from discord.ext import commands
+    from discord.ext import commands, tasks
     from dotenv import load_dotenv
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
 except ImportError as exc:  # pragma: no cover
@@ -47,6 +50,15 @@ discord.VoiceClient.warn_nacl = False  # we don't use voice; hides the PyNaCl/da
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
 
+# Banner shown above the verification panel. Discord CDN links EXPIRE, so the bot prefers a local
+# file named verify_banner.png next to bot.py (it gets uploaded and never expires). This URL is the fallback.
+BANNER_FILENAME = "verify_banner.png"
+DEFAULT_VERIFY_BANNER_URL = (
+    "https://cdn.discordapp.com/attachments/1553465204946370770/1568997079685275910/"
+    "e956f943-8f12-4e02-ab4a-006cea49900d.png?ex=6af1d9e6&is=6af08866&"
+    "hm=9165c850258d32dbffb3a21a536fbb93d39649c3cabe58eb41e990bbd859ee1d&"
+)
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  CONFIG  (.env)
@@ -62,6 +74,13 @@ class Config:
     verify_channel_id: int
     verified_role_id: int
     verify_log_channel_id: int | None
+    verify_banner_url: str
+    top_donor_role_id: int | None
+    daily_reward_channel_id: int
+    claim_role_id: int
+    claim_category_id: int | None
+    daily_reward_prize: str
+    daily_reward_timezone: str
     donation_admin_role_ids: tuple[int, ...]
     mod_role_ids: tuple[int, ...]
     leaderboard_size: int
@@ -132,6 +151,17 @@ def load_config() -> Config:
     verify_channel = number("VERIFY_CHANNEL_ID")
     verified_role = number("VERIFIED_ROLE_ID")
     verify_log_channel = number("VERIFY_LOG_CHANNEL_ID", required=False)
+    banner_url = text("VERIFY_BANNER_URL", DEFAULT_VERIFY_BANNER_URL)
+    top_donor_role = number("TOP_DONOR_ROLE_ID", required=False)
+    daily_channel = number("DAILY_REWARD_CHANNEL_ID")
+    claim_role = number("CLAIM_ROLE_ID")
+    claim_category = number("CLAIM_TICKET_CATEGORY_ID", required=False)
+    daily_prize = text("DAILY_REWARD_PRIZE", "200m Gems Exp")
+    tz_name = text("DAILY_REWARD_TIMEZONE", "UTC")
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        problems.append(f"DAILY_REWARD_TIMEZONE {tz_name!r} isn't a valid timezone (try UTC or Asia/Jerusalem)")
     donation_roles = id_list("DONATION_ADMIN_ROLE_IDS")
     mod_roles = id_list("MOD_ROLE_IDS")
     size = number("LEADERBOARD_SIZE", required=False) or 10
@@ -150,6 +180,13 @@ def load_config() -> Config:
         verify_channel_id=verify_channel,  # type: ignore[arg-type]
         verified_role_id=verified_role,  # type: ignore[arg-type]
         verify_log_channel_id=verify_log_channel,
+        verify_banner_url=banner_url,
+        top_donor_role_id=top_donor_role,
+        daily_reward_channel_id=daily_channel,  # type: ignore[arg-type]
+        claim_role_id=claim_role,  # type: ignore[arg-type]
+        claim_category_id=claim_category,
+        daily_reward_prize=daily_prize,
+        daily_reward_timezone=tz_name,
         donation_admin_role_ids=donation_roles,
         mod_role_ids=mod_roles,
         leaderboard_size=max(1, min(25, size)),
@@ -302,6 +339,28 @@ CREATE INDEX IF NOT EXISTS idx_cases_user ON cases(user_id);
 
 CREATE TABLE IF NOT EXISTS banned_words (word TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS daily_entries (
+    day     TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    entries INTEGER NOT NULL,
+    PRIMARY KEY (day, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_rewards (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    day               TEXT NOT NULL UNIQUE,
+    winner_id         INTEGER NOT NULL,
+    entries           INTEGER NOT NULL,
+    total_entries     INTEGER NOT NULL,
+    prize             TEXT NOT NULL,
+    message_id        INTEGER,
+    ticket_channel_id INTEGER,
+    ticket_number     INTEGER,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rewards_message ON daily_rewards(message_id);
+CREATE INDEX IF NOT EXISTS idx_rewards_ticket ON daily_rewards(ticket_channel_id);
 """
 
 
@@ -429,6 +488,66 @@ class Database:
         _, count = await self._exec("DELETE FROM banned_words WHERE word = ?", (word,))
         return count > 0
 
+    # ---- daily chat rewards
+    async def add_entries(self, rows: list[tuple[str, int, int]]) -> None:
+        """rows = [(day, user_id, entries_to_add), ...] written in one transaction."""
+        await self.conn.executemany(
+            "INSERT INTO daily_entries(day, user_id, entries) VALUES(?, ?, ?) "
+            "ON CONFLICT(day, user_id) DO UPDATE SET entries = daily_entries.entries + excluded.entries",
+            rows,
+        )
+        await self.conn.commit()
+
+    async def day_entries(self, day: str):
+        return await self._all(
+            "SELECT user_id, entries FROM daily_entries WHERE day = ? ORDER BY entries DESC, user_id ASC", (day,)
+        )
+
+    async def user_entries(self, day: str, user_id: int) -> int:
+        row = await self._one("SELECT entries FROM daily_entries WHERE day = ? AND user_id = ?", (day, user_id))
+        return int(row["entries"]) if row else 0
+
+    async def prune_entries(self, before_day: str) -> None:
+        await self._exec("DELETE FROM daily_entries WHERE day < ?", (before_day,))
+
+    async def create_reward(self, day: str, winner_id: int, entries: int, total: int, prize: str) -> int | None:
+        """Claims the day. Returns the reward id, or None if that day was already drawn."""
+        reward_id, count = await self._exec(
+            "INSERT OR IGNORE INTO daily_rewards(day, winner_id, entries, total_entries, prize, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (day, winner_id, entries, total, prize, int(time.time())),
+        )
+        return reward_id if count > 0 else None
+
+    async def delete_reward(self, reward_id: int) -> None:
+        await self._exec("DELETE FROM daily_rewards WHERE id = ?", (reward_id,))
+
+    async def set_reward_message(self, reward_id: int, message_id: int) -> None:
+        await self._exec("UPDATE daily_rewards SET message_id = ? WHERE id = ?", (message_id, reward_id))
+
+    async def set_reward_ticket(self, reward_id: int, channel_id: int, number: int) -> None:
+        await self._exec(
+            "UPDATE daily_rewards SET ticket_channel_id = ?, ticket_number = ? WHERE id = ?",
+            (channel_id, number, reward_id),
+        )
+
+    async def get_reward_by_day(self, day: str):
+        return await self._one("SELECT * FROM daily_rewards WHERE day = ?", (day,))
+
+    async def get_reward_by_message(self, message_id: int):
+        return await self._one("SELECT * FROM daily_rewards WHERE message_id = ?", (message_id,))
+
+    async def get_reward_by_ticket(self, channel_id: int):
+        return await self._one("SELECT * FROM daily_rewards WHERE ticket_channel_id = ?", (channel_id,))
+
+    async def last_reward(self):
+        return await self._one("SELECT * FROM daily_rewards ORDER BY day DESC LIMIT 1")
+
+    async def next_ticket_number(self) -> int:
+        number = int(await self.kv_get("claim_ticket_counter", "0")) + 1
+        await self.kv_set("claim_ticket_counter", str(number))
+        return number
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  PERMISSION CHECKS
@@ -489,6 +608,9 @@ ACTIONS: dict[str, tuple[str, str, int]] = {
     "verify_lock": ("🚫", "Verification Lockout", C.ERROR),
     "verify_manual": ("🛡️", "Manually Verified", C.SUCCESS),
     "verify_revoke": ("↩️", "Verification Revoked", C.WARN),
+    "daily_draw": ("🎉", "Daily Chat Reward Drawn", C.GEM),
+    "claim_open": ("🎫", "Claim Ticket Opened", C.INFO),
+    "claim_close": ("🔒", "Claim Ticket Closed", C.NEUTRAL),
 }
 
 
@@ -580,6 +702,24 @@ class ModLogger:
             footer=f"User ID: {member.id}",
         )
         await self.send(self.bot.cfg.verify_log_channel_id or self.bot.cfg.mod_log_channel_id, embed)
+
+    async def log_member_event(
+        self,
+        action: str,
+        member: discord.abc.User,
+        *,
+        fields: Iterable[tuple[str, str, bool]] = (),
+    ) -> None:
+        """Generic member-centred event (daily rewards, claim tickets) -> mod log."""
+        emoji, label, color = ACTIONS[action]
+        embed = make_embed(
+            f"{emoji} {label}",
+            color=color,
+            fields=[("👤 Member", f"{member.mention}\n`{member.id}`", True), *fields],
+            thumbnail=member.display_avatar.url,
+            footer=f"User ID: {member.id}",
+        )
+        await self.send(self.bot.cfg.mod_log_channel_id, embed)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -728,7 +868,7 @@ class NightFrostBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.db.connect()
-        for cog in (Donations(self), Moderation(self), AutoMod(self), Verification(self)):
+        for cog in (Donations(self), Moderation(self), AutoMod(self), Verification(self), DailyRewards(self)):
             await self.add_cog(cog)
             log.info("Loaded %s", type(cog).__name__)
 
@@ -756,6 +896,8 @@ class NightFrostBot(commands.Bot):
 # ════════════════════════════════════════════════════════════════════════
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 KV_LEADERBOARD_MESSAGE = "leaderboard_message_id"
+KV_TOP_DONORS = "top_donor_ids"
+TOP_DONOR_COUNT = 5  # how many top donors get TOP_DONOR_ROLE_ID
 
 
 class Donations(commands.Cog):
@@ -766,6 +908,7 @@ class Donations(commands.Cog):
     def __init__(self, bot: NightFrostBot) -> None:
         self.bot = bot
         self._lock = asyncio.Lock()
+        self._role_lock = asyncio.Lock()
 
     # ---- leaderboard
     async def build_leaderboard_embed(self) -> discord.Embed:
@@ -824,9 +967,106 @@ class Donations(commands.Cog):
             except discord.HTTPException:
                 log.exception("Could not post the leaderboard message")
 
+    # ---- top-5 donor role
+    def _guild(self) -> discord.Guild | None:
+        cfg = self.bot.cfg
+        if cfg.guild_id:
+            return self.bot.get_guild(cfg.guild_id)
+        channel = self.bot.get_channel(cfg.leaderboard_channel_id)
+        return getattr(channel, "guild", None)
+
+    async def sync_top_role(self) -> None:
+        """Give the current top-5 donors TOP_DONOR_ROLE_ID and take it away from everyone else."""
+        role_id = self.bot.cfg.top_donor_role_id
+        if not role_id:
+            return
+        async with self._role_lock:
+            guild = self._guild()
+            role = guild.get_role(role_id) if guild else None
+            if role is None:
+                log.warning("Top donor role %s not found - check TOP_DONOR_ROLE_ID and that the bot is in the server", role_id)
+                return
+
+            top = {row["user_id"] for row in await self.bot.db.top_donors(TOP_DONOR_COUNT)}
+            try:
+                previous = set(json.loads(await self.bot.db.kv_get(KV_TOP_DONORS, "[]")))
+            except ValueError:
+                previous = set()
+            holders = {m.id for m in role.members}  # anyone we can currently see holding the role
+
+            async def member_of(user_id: int) -> discord.Member | None:
+                member = guild.get_member(user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(user_id)
+                    except discord.HTTPException:
+                        return None  # left the server / unreachable
+                return member
+
+            for user_id in (previous | holders) - top:
+                member = await member_of(user_id)
+                if member and role in member.roles:
+                    try:
+                        await member.remove_roles(role, reason="No longer a top-5 donor")
+                    except discord.HTTPException:
+                        log.warning("Couldn't remove the top donor role from %s (check my role position)", user_id)
+            for user_id in top:
+                member = await member_of(user_id)
+                if member and role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason="Top-5 donor")
+                    except discord.HTTPException:
+                        log.warning("Couldn't give the top donor role to %s (check my role position)", user_id)
+            await self.bot.db.kv_set(KV_TOP_DONORS, json.dumps(sorted(top)))
+
+    # ---- donation embeds / DM
+    @staticmethod
+    def donation_embed(
+        user: discord.abc.User, value: int, total: int, rank: int | None, note: str | None,
+        donation_id: int, *, dm_guild: str | None = None,
+    ) -> discord.Embed:
+        """The 'New Donation' embed. With dm_guild set it becomes the thank-you version sent to the donor."""
+        if dm_guild:
+            title = "💎 Thank you for your donation!"
+            description = (
+                f"Hey **{user.display_name}**! Your donation of **{format_amount(value)}** gems to "
+                f"**{dm_guild}** has been recorded.\nThank you for supporting the community 💜"
+            )
+            if rank and rank <= TOP_DONOR_COUNT:
+                description += f"\n\n🏅 You're currently one of our **Top {TOP_DONOR_COUNT} donors**!"
+        else:
+            title = "💎 New Donation!"
+            description = (
+                f"{user.mention} just donated **{format_amount(value)}** gems!\n"
+                "Thank you for supporting the community 💜"
+            )
+        return make_embed(
+            title,
+            description,
+            C.GEM,
+            fields=[
+                ("💰 Amount", f"**{format_amount(value)}**\n`{value:,}`", True),
+                ("📊 Total Donated", f"**{format_amount(total)}**", True),
+                ("🏆 Rank", f"**#{rank}**", True),
+                *([("📝 Note", note, False)] if note else []),
+            ],
+            thumbnail=user.display_avatar.url,
+            footer=f"Donation #{donation_id}",
+        )
+
+    async def _dm_donor(self, user: discord.abc.User, guild_name: str, value: int, total: int,
+                        rank: int | None, note: str | None, donation_id: int) -> bool:
+        embed = self.donation_embed(user, value, total, rank, note, donation_id, dm_guild=guild_name)
+        try:
+            await user.send(embed=embed)
+            return True
+        except discord.HTTPException:  # DMs closed / user blocked the bot
+            return False
+
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         await self.refresh_leaderboard()
+        await self.sync_top_role()
 
     # ---- commands
     @app_commands.command(name="leaderboard", description="🏆 Show the gem donation leaderboard")
@@ -863,25 +1103,17 @@ class Donations(commands.Cog):
         rank = await self.bot.db.user_rank(user.id)
 
         # 1) Announce in the donation channel
-        announce = make_embed(
-            "💎 New Donation!",
-            f"{user.mention} just donated **{format_amount(value)}** gems!\nThank you for supporting the community 💜",
-            C.GEM,
-            fields=[
-                ("💰 Amount", f"**{format_amount(value)}**\n`{value:,}`", True),
-                ("📊 Total Donated", f"**{format_amount(total)}**", True),
-                ("🏆 Rank", f"**#{rank}**", True),
-                *([("📝 Note", note, False)] if note else []),
-            ],
-            thumbnail=user.display_avatar.url,
-            footer=f"Donation #{donation_id}",
-        )
+        announce = self.donation_embed(user, value, total, rank, note, donation_id)
         await self.bot.modlog.send(self.bot.cfg.donation_channel_id, announce)
 
-        # 2) Update the live leaderboard
-        await self.refresh_leaderboard()
+        # 2) Thank the donor by DM
+        dm_sent = await self._dm_donor(user, interaction.guild.name, value, total, rank, note, donation_id)
 
-        # 3) Admin log
+        # 3) Update the live leaderboard and the top-5 role
+        await self.refresh_leaderboard()
+        await self.sync_top_role()
+
+        # 4) Admin log
         await self.bot.modlog.log_event(
             "donation_add",
             interaction.user,
@@ -889,6 +1121,7 @@ class Donations(commands.Cog):
                 ("👤 Donor", f"{user.mention}\n`{user.id}`", True),
                 ("💰 Amount", f"**{format_amount(value)}** (`{value:,}`)", True),
                 ("📊 New Total", f"**{format_amount(total)}**", True),
+                ("📨 Thank-you DM", "✅ Sent" if dm_sent else "❌ DMs closed", True),
                 *([("📝 Note", note, False)] if note else []),
             ],
         )
@@ -896,7 +1129,8 @@ class Donations(commands.Cog):
         await interaction.followup.send(
             embed=success_embed(
                 f"Added **{format_amount(value)}** 💎 for {user.mention} (donation `#{donation_id}`).\n"
-                f"Their total is now **{format_amount(total)}**."
+                f"Their total is now **{format_amount(total)}**.\n"
+                f"📨 Thank-you DM: {'sent ✅' if dm_sent else 'not delivered (their DMs are closed) ❌'}"
             ),
             ephemeral=True,
         )
@@ -913,6 +1147,7 @@ class Donations(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await self.bot.db.remove_donation(donation_id)
         await self.refresh_leaderboard()
+        await self.sync_top_role()
 
         await self.bot.modlog.log_event(
             "donation_remove",
@@ -972,6 +1207,7 @@ class Donations(commands.Cog):
     async def refresh(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         await self.refresh_leaderboard()
+        await self.sync_top_role()
         await interaction.followup.send(embed=success_embed("Leaderboard refreshed."), ephemeral=True)
 
 
@@ -1274,11 +1510,10 @@ class Moderation(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            deleted = await channel.purge(
-                limit=amount,
-                check=(lambda m: m.author.id == member.id) if member else None,
-                reason=self._audit(interaction, "Purge"),
-            )
+            options = {}
+            if member:  # only pass `check` when filtering - discord.py breaks if it's given as None
+                options["check"] = lambda m: m.author.id == member.id
+            deleted = await channel.purge(limit=amount, reason=self._audit(interaction, "Purge"), **options)
         except discord.HTTPException as exc:
             await self._fail(interaction, exc)
             return
@@ -1402,20 +1637,24 @@ class AutoMod(commands.Cog):
         return sorted(hits)
 
     # ---- listeners
-    async def _scan(self, message: discord.Message) -> None:
+    def is_blocked(self, message: discord.Message) -> bool:
+        """True if AutoMod would act on this message. Daily rewards use this so blocked messages never count."""
         if not self.enabled or not self.words:
-            return
+            return False
         if message.guild is None or message.author.bot or message.webhook_id:
-            return
+            return False
         author = message.author
         if not isinstance(author, discord.Member) or not message.content:
-            return
+            return False
         if author.guild_permissions.manage_messages or is_moderator(author, self.bot.cfg.mod_role_ids):
-            return
+            return False
+        return bool(self.find_matches(message.content))
 
-        hits = self.find_matches(message.content)
-        if not hits:
+    async def _scan(self, message: discord.Message) -> None:
+        if not self.is_blocked(message):
             return
+        author = message.author
+        hits = self.find_matches(message.content)
 
         deleted = True
         try:
@@ -1624,6 +1863,18 @@ class Verification(commands.Cog):
             timestamp=False,
         )
 
+    def panel_embeds(self) -> tuple[list[discord.Embed], discord.File | None]:
+        """[banner image embed, original panel embed] (+ the banner file when a local one exists)."""
+        banner = discord.Embed(color=C.INFO)
+        local = ROOT / BANNER_FILENAME
+        file = None
+        if local.exists():  # preferred: uploaded by the bot, never expires
+            file = discord.File(local, filename=BANNER_FILENAME)
+            banner.set_image(url=f"attachment://{BANNER_FILENAME}")
+        else:
+            banner.set_image(url=self.bot.cfg.verify_banner_url)
+        return [banner, self.panel_embed()], file
+
     async def build_challenge(self, user_id: int) -> tuple[discord.Embed, discord.File]:
         code = self.captcha.issue(user_id)
         buf = await asyncio.to_thread(render_captcha, code)  # keep the event loop free
@@ -1654,9 +1905,9 @@ class Verification(commands.Cog):
         if message_id:
             try:
                 old = await channel.fetch_message(int(message_id))
-                if not force:
+                if not force and len(old.embeds) >= 2:  # already the two-embed layout
                     return channel
-                await old.delete()
+                await old.delete()  # forced repost, or upgrading the old one-embed panel
             except discord.NotFound:
                 pass
             except discord.HTTPException:
@@ -1664,7 +1915,9 @@ class Verification(commands.Cog):
                 return channel
 
         try:
-            message = await channel.send(embed=self.panel_embed(), view=VerifyPanelView(self))
+            embeds, file = self.panel_embeds()
+            extra = {"file": file} if file else {}
+            message = await channel.send(embeds=embeds, view=VerifyPanelView(self), **extra)
             await self.bot.db.kv_set(KV_VERIFY_PANEL, str(message.id))
         except discord.HTTPException:
             log.exception("Could not post the verify panel")
@@ -1788,6 +2041,352 @@ class Verification(commands.Cog):
         await self.bot.modlog.log_verify(
             "verify_revoke", member, fields=[("🛡️ Moderator", interaction.user.mention, True)]
         )
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  🎁 DAILY CHAT REWARDS  (1 message = 1 entry -> winner drawn at midnight -> claim ticket)
+# ════════════════════════════════════════════════════════════════════════
+CLAIM_BUTTON_ID = "nightfrost:claim:open"
+CLOSE_BUTTON_ID = "nightfrost:claim:close"
+KV_LAST_DRAW_CHECK = "daily_last_draw_check"
+ENTRY_FLUSH_SECONDS = 20  # entries are buffered in memory and written to the database in batches
+
+
+class ClaimView(discord.ui.View):
+    """Persistent 'Claim Reward' button under the winner announcement."""
+
+    def __init__(self, cog: "DailyRewards", *, opened: bool = False) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        if opened:
+            self.claim.disabled = True
+            self.claim.label = "Ticket Opened"
+
+    @discord.ui.button(label="Claim Reward", emoji="🎁", style=discord.ButtonStyle.success, custom_id=CLAIM_BUTTON_ID)
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_ticket(interaction)
+
+
+class CloseTicketView(discord.ui.View):
+    """Persistent 'Close Ticket' button inside each claim ticket (claim role / admins only)."""
+
+    def __init__(self, cog: "DailyRewards") -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id=CLOSE_BUTTON_ID)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.close_ticket(interaction)
+
+
+class DailyRewards(commands.Cog):
+    """🎁 Every non-bot message earns an entry; once a day one entry-weighted winner gets a claim button."""
+
+    reward = app_commands.Group(name="reward", description="🎁 Daily chat rewards", guild_only=True)
+
+    def __init__(self, bot: NightFrostBot) -> None:
+        self.bot = bot
+        self.tz = ZoneInfo(bot.cfg.daily_reward_timezone)
+        self.buffer: dict[tuple[str, int], int] = defaultdict(int)
+        self._flush_lock = asyncio.Lock()
+        self._ticket_lock = asyncio.Lock()
+        self._rng = random.SystemRandom()
+
+    async def cog_load(self) -> None:
+        self.bot.add_view(ClaimView(self))        # buttons keep working after restarts
+        self.bot.add_view(CloseTicketView(self))
+        self.flush_loop.start()
+        self.draw_loop.start()
+
+    async def cog_unload(self) -> None:
+        self.flush_loop.cancel()
+        self.draw_loop.cancel()
+        await self.flush()
+
+    # ---- time helpers
+    def now(self) -> dt.datetime:
+        return dt.datetime.now(self.tz)
+
+    def today(self) -> str:
+        return self.now().date().isoformat()
+
+    def next_draw(self) -> dt.datetime:
+        return (self.now() + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # ---- entry counting
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.guild is None or message.author.bot or message.webhook_id:
+            return
+        automod = self.bot.get_cog("AutoMod")
+        if automod is not None and automod.is_blocked(message):  # automodded messages never count
+            return
+        self.buffer[(self.today(), message.author.id)] += 1
+
+    async def flush(self) -> None:
+        """Write buffered entries to the database in one transaction."""
+        async with self._flush_lock:
+            if not self.buffer:
+                return
+            snapshot, self.buffer = self.buffer, defaultdict(int)
+            try:
+                await self.bot.db.add_entries([(day, uid, n) for (day, uid), n in snapshot.items()])
+            except Exception:
+                log.exception("Could not save daily entries - will retry")
+                for key, n in snapshot.items():
+                    self.buffer[key] += n
+
+    @tasks.loop(seconds=ENTRY_FLUSH_SECONDS)
+    async def flush_loop(self) -> None:
+        await self.flush()
+
+    @tasks.loop(seconds=60)
+    async def draw_loop(self) -> None:
+        """Every minute: if yesterday hasn't been drawn yet, draw it (also catches up after downtime)."""
+        try:
+            await self.flush()
+            yesterday = (self.now().date() - dt.timedelta(days=1)).isoformat()
+            if await self.bot.db.kv_get(KV_LAST_DRAW_CHECK) == yesterday:
+                return
+            if await self.run_draw(yesterday) != "retry":
+                await self.bot.db.kv_set(KV_LAST_DRAW_CHECK, yesterday)
+        except Exception:
+            log.exception("Daily draw check failed")
+
+    @flush_loop.before_loop
+    @draw_loop.before_loop
+    async def _wait_until_ready(self) -> None:
+        await self.bot.wait_until_ready()
+
+    # ---- the draw
+    async def _reward_channel(self):
+        channel = self.bot.get_channel(self.bot.cfg.daily_reward_channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(self.bot.cfg.daily_reward_channel_id)
+            except discord.HTTPException:
+                log.warning("Daily reward channel not found - check DAILY_REWARD_CHANNEL_ID")
+                return None
+        return channel
+
+    async def run_draw(self, day: str) -> str:
+        """Returns 'drawn' | 'already' | 'none' (nobody chatted / no valid winner) | 'retry' (try again later)."""
+        if await self.bot.db.get_reward_by_day(day):
+            return "already"
+        rows = await self.bot.db.day_entries(day)
+        if not rows:
+            return "none"
+        channel = await self._reward_channel()
+        if channel is None:
+            return "retry"
+        guild = channel.guild
+
+        pool = {row["user_id"]: row["entries"] for row in rows}
+        total = sum(pool.values())
+        winner: discord.Member | None = None
+        while pool:  # each entry is one ticket in the hat; skip people who left the server
+            user_id = self._rng.choices(list(pool), weights=list(pool.values()))[0]
+            try:
+                winner = guild.get_member(user_id) or await guild.fetch_member(user_id)
+                break
+            except discord.NotFound:
+                del pool[user_id]
+            except discord.HTTPException:
+                return "retry"
+        if winner is None:
+            return "none"
+        winner_entries = pool[winner.id]
+
+        prize = self.bot.cfg.daily_reward_prize
+        reward_id = await self.bot.db.create_reward(day, winner.id, winner_entries, total, prize)
+        if reward_id is None:
+            return "already"
+        try:
+            message = await channel.send(
+                content=f"🎉 Congratulations {winner.mention}\n\nYou won {prize} in Daily Chat Reward.",
+                view=ClaimView(self),
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except discord.HTTPException:
+            log.exception("Could not post the daily reward announcement")
+            await self.bot.db.delete_reward(reward_id)  # un-claim the day so it retries
+            return "retry"
+        await self.bot.db.set_reward_message(reward_id, message.id)
+
+        await self.bot.modlog.log_member_event(
+            "daily_draw", winner,
+            fields=[("📅 Day", day, True), ("🎁 Prize", prize, True),
+                    ("🎟️ Entries", f"**{winner_entries}** of {total}", True),
+                    ("👥 Participants", f"**{len(rows)}**", True)],
+        )
+        await self.bot.db.prune_entries((self.now().date() - dt.timedelta(days=14)).isoformat())
+        return "drawn"
+
+    # ---- claim tickets
+    async def open_ticket(self, interaction: discord.Interaction) -> None:
+        db, cfg = self.bot.db, self.bot.cfg
+        message = interaction.message
+        reward = await db.get_reward_by_message(message.id) if message else None
+        if reward is None:
+            await respond(interaction, error_embed("I can't find this reward any more."), ephemeral=True)
+            return
+        if interaction.user.id != reward["winner_id"]:
+            await respond(interaction, error_embed("🔒 Only the winner can claim this reward."), ephemeral=True)
+            return
+
+        async with self._ticket_lock:  # stops a double-click from opening two tickets
+            reward = await db.get_reward_by_message(message.id)
+            if reward["ticket_channel_id"]:
+                await respond(interaction, error_embed(f"You already opened a ticket: <#{reward['ticket_channel_id']}>"), ephemeral=True)
+                return
+            guild = interaction.guild
+            role = guild.get_role(cfg.claim_role_id)
+            if role is None:
+                await respond(interaction, error_embed("The claim role isn't set up correctly. Ask an admin."), ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            number = await db.next_ticket_number()
+            winner = interaction.user
+            seen = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                winner: seen,
+                role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                                  attach_files=True, manage_messages=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                                      embed_links=True, manage_channels=True),
+            }
+            category = guild.get_channel(cfg.claim_category_id) if cfg.claim_category_id else None
+            if not isinstance(category, discord.CategoryChannel):
+                category = None
+            try:
+                channel = await guild.create_text_channel(
+                    f"claim-ticket-{number}", overwrites=overwrites, category=category,
+                    topic=f"Daily Chat Reward claim for {winner} ({winner.id})",
+                    reason=f"Daily reward claim ticket for {winner}",
+                )
+            except discord.HTTPException:
+                log.exception("Could not create the claim ticket channel")
+                await interaction.followup.send(
+                    embed=error_embed("I couldn't create the ticket (I need **Manage Channels**). Tell a moderator."), ephemeral=True)
+                return
+            await db.set_reward_ticket(reward["id"], channel.id, number)
+
+        embed = make_embed(
+            f"🎫 Claim Ticket #{number}",
+            f"{winner.mention} won **{reward['prize']}** in the Daily Chat Reward ({reward['day']}).\n\n"
+            f"A member of {role.mention} will hand over your reward here. Please stay in this channel.",
+            C.GEM,
+            thumbnail=winner.display_avatar.url,
+        )
+        try:
+            await channel.send(
+                content=f"{winner.mention} {role.mention}", embed=embed, view=CloseTicketView(self),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            )
+        except discord.HTTPException:
+            log.exception("Could not post in the claim ticket")
+        try:
+            await message.edit(view=ClaimView(self, opened=True))  # grey out the button
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(embed=success_embed(f"Your claim ticket is ready: {channel.mention}"), ephemeral=True)
+        await self.bot.modlog.log_member_event(
+            "claim_open", winner,
+            fields=[("🎫 Ticket", channel.mention, True), ("🎁 Prize", reward["prize"], True)],
+        )
+
+    async def close_ticket(self, interaction: discord.Interaction) -> None:
+        reward = await self.bot.db.get_reward_by_ticket(interaction.channel_id)
+        if reward is None:
+            await respond(interaction, error_embed("This isn't a claim ticket."), ephemeral=True)
+            return
+        member = interaction.user
+        role = interaction.guild.get_role(self.bot.cfg.claim_role_id)
+        if not (isinstance(member, discord.Member) and (member.guild_permissions.administrator or (role and role in member.roles))):
+            await respond(interaction, error_embed("🔒 Only the claim team can close tickets."), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=make_embed("🔒 Closing ticket", "This channel will be deleted in 5 seconds.", C.WARN, timestamp=False))
+        await asyncio.sleep(5)
+        winner = interaction.guild.get_member(reward["winner_id"])
+        if winner is None:
+            try:
+                winner = await self.bot.fetch_user(reward["winner_id"])
+            except discord.HTTPException:
+                winner = None
+        if winner is not None:
+            await self.bot.modlog.log_member_event(
+                "claim_close", winner,
+                fields=[("🎫 Ticket", f"`claim-ticket-{reward['ticket_number']}`", True), ("🛡️ Closed by", member.mention, True)],
+            )
+        try:
+            await interaction.channel.delete(reason=f"Claim ticket closed by {member} ({member.id})")
+        except discord.HTTPException:
+            log.warning("Could not delete the claim ticket channel")
+
+    # ---- commands
+    @reward.command(name="entries", description="🎟️ See how many entries you (or someone) have today")
+    @app_commands.describe(user="Defaults to yourself")
+    async def entries(self, interaction: discord.Interaction, user: discord.User | None = None) -> None:
+        user = user or interaction.user
+        await self.flush()
+        day = self.today()
+        mine = await self.bot.db.user_entries(day, user.id)
+        total = sum(r["entries"] for r in await self.bot.db.day_entries(day))
+        chance = f"{mine / total * 100:.1f}%" if total else "—"
+        embed = make_embed(
+            f"🎟️ Daily entries • {user.display_name}",
+            "Every message you send earns **1 entry**. Messages removed by AutoMod don't count.",
+            C.GEM,
+            fields=[
+                ("🎟️ Entries today", f"**{mine}**", True),
+                ("🎯 Win chance", f"**{chance}**", True),
+                ("⏰ Draw", f"<t:{int(self.next_draw().timestamp())}:R>", True),
+            ],
+            thumbnail=user.display_avatar.url,
+        )
+        await respond(interaction, embed, ephemeral=True)
+
+    @reward.command(name="status", description="📊 Today's entries and the last winner")
+    @moderator()
+    async def status(self, interaction: discord.Interaction) -> None:
+        await self.flush()
+        rows = await self.bot.db.day_entries(self.today())
+        total = sum(r["entries"] for r in rows)
+        top = "\n".join(f"`#{i}` <@{r['user_id']}> — **{r['entries']}**" for i, r in enumerate(rows[:5], 1)) or "No entries yet."
+        last = await self.bot.db.last_reward()
+        last_text = f"<@{last['winner_id']}> • {last['day']} • {last['prize']}" if last else "—"
+        embed = make_embed(
+            "📊 Daily chat reward status",
+            color=C.GEM,
+            fields=[
+                ("📅 Day", self.today(), True),
+                ("🎟️ Entries", f"**{total}**", True),
+                ("👥 Participants", f"**{len(rows)}**", True),
+                ("🎁 Prize", self.bot.cfg.daily_reward_prize, True),
+                ("⏰ Next draw", f"<t:{int(self.next_draw().timestamp())}:R>", True),
+                ("🌍 Timezone", self.bot.cfg.daily_reward_timezone, True),
+                ("🏆 Top today", top, False),
+                ("🎉 Last winner", last_text, False),
+            ],
+        )
+        await respond(interaction, embed, ephemeral=True)
+
+    @reward.command(name="draw", description="🎉 End today's draw now and pick a winner")
+    @moderator()
+    async def draw(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self.flush()
+        result = await self.run_draw(self.today())
+        messages = {
+            "drawn": success_embed("Winner drawn! Check the reward channel. Today's draw is now closed."),
+            "already": error_embed("Today's reward was already drawn."),
+            "none": error_embed("Nobody has entries today yet."),
+            "retry": error_embed("I couldn't post in the reward channel. Check DAILY_REWARD_CHANNEL_ID and my permissions."),
+        }
+        await interaction.followup.send(embed=messages[result], ephemeral=True)
 
 
 # ════════════════════════════════════════════════════════════════════════
