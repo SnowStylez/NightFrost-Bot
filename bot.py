@@ -53,6 +53,7 @@ ENV_PATH = ROOT / ".env"
 # Banner shown above the verification panel. Discord CDN links EXPIRE, so the bot prefers a local
 # file named verify_banner.png next to bot.py (it gets uploaded and never expires). This URL is the fallback.
 BANNER_FILENAME = "verify_banner.png"
+DEFAULT_GIVEAWAY_CLAIM_CHANNEL_ID = 1440760203976118414  # channel winners are told to open a claim ticket in
 DEFAULT_VERIFY_BANNER_URL = (
     "https://cdn.discordapp.com/attachments/1553465204946370770/1568997079685275910/"
     "e956f943-8f12-4e02-ab4a-006cea49900d.png?ex=6af1d9e6&is=6af08866&"
@@ -77,8 +78,7 @@ class Config:
     verify_banner_url: str
     top_donor_role_id: int | None
     daily_reward_channel_id: int
-    claim_role_id: int
-    claim_category_id: int | None
+    giveaway_claim_channel_id: int
     daily_reward_prize: str
     daily_reward_timezone: str
     donation_admin_role_ids: tuple[int, ...]
@@ -154,8 +154,7 @@ def load_config() -> Config:
     banner_url = text("VERIFY_BANNER_URL", DEFAULT_VERIFY_BANNER_URL)
     top_donor_role = number("TOP_DONOR_ROLE_ID", required=False)
     daily_channel = number("DAILY_REWARD_CHANNEL_ID")
-    claim_role = number("CLAIM_ROLE_ID")
-    claim_category = number("CLAIM_TICKET_CATEGORY_ID", required=False)
+    claim_channel = number("GIVEAWAY_CLAIM_CHANNEL_ID", required=False) or DEFAULT_GIVEAWAY_CLAIM_CHANNEL_ID
     daily_prize = text("DAILY_REWARD_PRIZE", "200m Gems Exp")
     tz_name = text("DAILY_REWARD_TIMEZONE", "UTC")
     try:
@@ -183,8 +182,7 @@ def load_config() -> Config:
         verify_banner_url=banner_url,
         top_donor_role_id=top_donor_role,
         daily_reward_channel_id=daily_channel,  # type: ignore[arg-type]
-        claim_role_id=claim_role,  # type: ignore[arg-type]
-        claim_category_id=claim_category,
+        giveaway_claim_channel_id=claim_channel,
         daily_reward_prize=daily_prize,
         daily_reward_timezone=tz_name,
         donation_admin_role_ids=donation_roles,
@@ -355,12 +353,9 @@ CREATE TABLE IF NOT EXISTS daily_rewards (
     total_entries     INTEGER NOT NULL,
     prize             TEXT NOT NULL,
     message_id        INTEGER,
-    ticket_channel_id INTEGER,
-    ticket_number     INTEGER,
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rewards_message ON daily_rewards(message_id);
-CREATE INDEX IF NOT EXISTS idx_rewards_ticket ON daily_rewards(ticket_channel_id);
 """
 
 
@@ -525,28 +520,14 @@ class Database:
     async def set_reward_message(self, reward_id: int, message_id: int) -> None:
         await self._exec("UPDATE daily_rewards SET message_id = ? WHERE id = ?", (message_id, reward_id))
 
-    async def set_reward_ticket(self, reward_id: int, channel_id: int, number: int) -> None:
-        await self._exec(
-            "UPDATE daily_rewards SET ticket_channel_id = ?, ticket_number = ? WHERE id = ?",
-            (channel_id, number, reward_id),
-        )
-
     async def get_reward_by_day(self, day: str):
         return await self._one("SELECT * FROM daily_rewards WHERE day = ?", (day,))
 
     async def get_reward_by_message(self, message_id: int):
         return await self._one("SELECT * FROM daily_rewards WHERE message_id = ?", (message_id,))
 
-    async def get_reward_by_ticket(self, channel_id: int):
-        return await self._one("SELECT * FROM daily_rewards WHERE ticket_channel_id = ?", (channel_id,))
-
     async def last_reward(self):
         return await self._one("SELECT * FROM daily_rewards ORDER BY day DESC LIMIT 1")
-
-    async def next_ticket_number(self) -> int:
-        number = int(await self.kv_get("claim_ticket_counter", "0")) + 1
-        await self.kv_set("claim_ticket_counter", str(number))
-        return number
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -609,8 +590,6 @@ ACTIONS: dict[str, tuple[str, str, int]] = {
     "verify_manual": ("🛡️", "Manually Verified", C.SUCCESS),
     "verify_revoke": ("↩️", "Verification Revoked", C.WARN),
     "daily_draw": ("🎉", "Daily Chat Reward Drawn", C.GEM),
-    "claim_open": ("🎫", "Claim Ticket Opened", C.INFO),
-    "claim_close": ("🔒", "Claim Ticket Closed", C.NEUTRAL),
 }
 
 
@@ -710,7 +689,7 @@ class ModLogger:
         *,
         fields: Iterable[tuple[str, str, bool]] = (),
     ) -> None:
-        """Generic member-centred event (daily rewards, claim tickets) -> mod log."""
+        """Generic member-centred event (daily rewards) -> mod log."""
         emoji, label, color = ACTIONS[action]
         embed = make_embed(
             f"{emoji} {label}",
@@ -2044,43 +2023,14 @@ class Verification(commands.Cog):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  🎁 DAILY CHAT REWARDS  (1 message = 1 entry -> winner drawn at midnight -> claim ticket)
+#  🎁 DAILY CHAT REWARDS  (1 message = 1 entry -> winner drawn at midnight -> announcement)
 # ════════════════════════════════════════════════════════════════════════
-CLAIM_BUTTON_ID = "nightfrost:claim:open"
-CLOSE_BUTTON_ID = "nightfrost:claim:close"
 KV_LAST_DRAW_CHECK = "daily_last_draw_check"
 ENTRY_FLUSH_SECONDS = 20  # entries are buffered in memory and written to the database in batches
 
 
-class ClaimView(discord.ui.View):
-    """Persistent 'Claim Reward' button under the winner announcement."""
-
-    def __init__(self, cog: "DailyRewards", *, opened: bool = False) -> None:
-        super().__init__(timeout=None)
-        self.cog = cog
-        if opened:
-            self.claim.disabled = True
-            self.claim.label = "Ticket Opened"
-
-    @discord.ui.button(label="Claim Reward", emoji="🎁", style=discord.ButtonStyle.success, custom_id=CLAIM_BUTTON_ID)
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.open_ticket(interaction)
-
-
-class CloseTicketView(discord.ui.View):
-    """Persistent 'Close Ticket' button inside each claim ticket (claim role / admins only)."""
-
-    def __init__(self, cog: "DailyRewards") -> None:
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id=CLOSE_BUTTON_ID)
-    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.close_ticket(interaction)
-
-
 class DailyRewards(commands.Cog):
-    """🎁 Every non-bot message earns an entry; once a day one entry-weighted winner gets a claim button."""
+    """🎁 Every non-bot message earns an entry; once a day one entry-weighted winner is announced."""
 
     reward = app_commands.Group(name="reward", description="🎁 Daily chat rewards", guild_only=True)
 
@@ -2089,12 +2039,9 @@ class DailyRewards(commands.Cog):
         self.tz = ZoneInfo(bot.cfg.daily_reward_timezone)
         self.buffer: dict[tuple[str, int], int] = defaultdict(int)
         self._flush_lock = asyncio.Lock()
-        self._ticket_lock = asyncio.Lock()
         self._rng = random.SystemRandom()
 
     async def cog_load(self) -> None:
-        self.bot.add_view(ClaimView(self))        # buttons keep working after restarts
-        self.bot.add_view(CloseTicketView(self))
         self.flush_loop.start()
         self.draw_loop.start()
 
@@ -2203,8 +2150,11 @@ class DailyRewards(commands.Cog):
             return "already"
         try:
             message = await channel.send(
-                content=f"🎉 Congratulations {winner.mention}\n\nYou won {prize} in Daily Chat Reward.",
-                view=ClaimView(self),
+                content=(
+                    f"🎉 Congratulations {winner.mention}\n\n"
+                    f"You won {prize} in Daily Chat Reward.\n\n"
+                    f"open a giveaway claim ticket at <#{self.bot.cfg.giveaway_claim_channel_id}> to claim your reward!"
+                ),
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
         except discord.HTTPException:
@@ -2221,110 +2171,6 @@ class DailyRewards(commands.Cog):
         )
         await self.bot.db.prune_entries((self.now().date() - dt.timedelta(days=14)).isoformat())
         return "drawn"
-
-    # ---- claim tickets
-    async def open_ticket(self, interaction: discord.Interaction) -> None:
-        db, cfg = self.bot.db, self.bot.cfg
-        message = interaction.message
-        reward = await db.get_reward_by_message(message.id) if message else None
-        if reward is None:
-            await respond(interaction, error_embed("I can't find this reward any more."), ephemeral=True)
-            return
-        if interaction.user.id != reward["winner_id"]:
-            await respond(interaction, error_embed("🔒 Only the winner can claim this reward."), ephemeral=True)
-            return
-
-        async with self._ticket_lock:  # stops a double-click from opening two tickets
-            reward = await db.get_reward_by_message(message.id)
-            if reward["ticket_channel_id"]:
-                await respond(interaction, error_embed(f"You already opened a ticket: <#{reward['ticket_channel_id']}>"), ephemeral=True)
-                return
-            guild = interaction.guild
-            role = guild.get_role(cfg.claim_role_id)
-            if role is None:
-                await respond(interaction, error_embed("The claim role isn't set up correctly. Ask an admin."), ephemeral=True)
-                return
-
-            await interaction.response.defer(ephemeral=True)
-            number = await db.next_ticket_number()
-            winner = interaction.user
-            seen = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                winner: seen,
-                role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
-                                                  attach_files=True, manage_messages=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
-                                                      embed_links=True, manage_channels=True),
-            }
-            category = guild.get_channel(cfg.claim_category_id) if cfg.claim_category_id else None
-            if not isinstance(category, discord.CategoryChannel):
-                category = None
-            try:
-                channel = await guild.create_text_channel(
-                    f"claim-ticket-{number}", overwrites=overwrites, category=category,
-                    topic=f"Daily Chat Reward claim for {winner} ({winner.id})",
-                    reason=f"Daily reward claim ticket for {winner}",
-                )
-            except discord.HTTPException:
-                log.exception("Could not create the claim ticket channel")
-                await interaction.followup.send(
-                    embed=error_embed("I couldn't create the ticket (I need **Manage Channels**). Tell a moderator."), ephemeral=True)
-                return
-            await db.set_reward_ticket(reward["id"], channel.id, number)
-
-        embed = make_embed(
-            f"🎫 Claim Ticket #{number}",
-            f"{winner.mention} won **{reward['prize']}** in the Daily Chat Reward ({reward['day']}).\n\n"
-            f"A member of {role.mention} will hand over your reward here. Please stay in this channel.",
-            C.GEM,
-            thumbnail=winner.display_avatar.url,
-        )
-        try:
-            await channel.send(
-                content=f"{winner.mention} {role.mention}", embed=embed, view=CloseTicketView(self),
-                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-            )
-        except discord.HTTPException:
-            log.exception("Could not post in the claim ticket")
-        try:
-            await message.edit(view=ClaimView(self, opened=True))  # grey out the button
-        except discord.HTTPException:
-            pass
-        await interaction.followup.send(embed=success_embed(f"Your claim ticket is ready: {channel.mention}"), ephemeral=True)
-        await self.bot.modlog.log_member_event(
-            "claim_open", winner,
-            fields=[("🎫 Ticket", channel.mention, True), ("🎁 Prize", reward["prize"], True)],
-        )
-
-    async def close_ticket(self, interaction: discord.Interaction) -> None:
-        reward = await self.bot.db.get_reward_by_ticket(interaction.channel_id)
-        if reward is None:
-            await respond(interaction, error_embed("This isn't a claim ticket."), ephemeral=True)
-            return
-        member = interaction.user
-        role = interaction.guild.get_role(self.bot.cfg.claim_role_id)
-        if not (isinstance(member, discord.Member) and (member.guild_permissions.administrator or (role and role in member.roles))):
-            await respond(interaction, error_embed("🔒 Only the claim team can close tickets."), ephemeral=True)
-            return
-        await interaction.response.send_message(
-            embed=make_embed("🔒 Closing ticket", "This channel will be deleted in 5 seconds.", C.WARN, timestamp=False))
-        await asyncio.sleep(5)
-        winner = interaction.guild.get_member(reward["winner_id"])
-        if winner is None:
-            try:
-                winner = await self.bot.fetch_user(reward["winner_id"])
-            except discord.HTTPException:
-                winner = None
-        if winner is not None:
-            await self.bot.modlog.log_member_event(
-                "claim_close", winner,
-                fields=[("🎫 Ticket", f"`claim-ticket-{reward['ticket_number']}`", True), ("🛡️ Closed by", member.mention, True)],
-            )
-        try:
-            await interaction.channel.delete(reason=f"Claim ticket closed by {member} ({member.id})")
-        except discord.HTTPException:
-            log.warning("Could not delete the claim ticket channel")
 
     # ---- commands
     @reward.command(name="entries", description="🎟️ See how many entries you (or someone) have today")
